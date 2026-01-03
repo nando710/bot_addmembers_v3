@@ -271,7 +271,8 @@ app.get('/callback', async (req, res) => {
 
 // 3. Webhook de Gestão (Recebe do N8N para Banir ou Remover Cargo)
 app.post('/webhook/manage-user', async (req, res) => {
-    const { secret, action, discord_id, reason } = req.body;
+    // Adicionei role_id aqui
+    const { secret, action, discord_id, reason, role_id } = req.body;
 
     // Segurança Básica
     if (secret !== ADMIN_SECRET) {
@@ -288,13 +289,43 @@ app.post('/webhook/manage-user', async (req, res) => {
 
     try {
         const member = await guild.members.fetch(discord_id).catch(() => null);
-
-        if (action === 'ban') {
-            await guild.members.ban(discord_id, { reason: reason || 'Banimento via Webhook (Sistema)' });
-            discordLog('🔨 Usuário Banido', `ID: ${discord_id}\nMotivo: ${reason}`, Colors.Red);
-            return res.json({ success: true, message: 'Usuário banido.' });
+        
+        // Verifica se membro existe no servidor (Necessário para remover cargos)
+        if (!member) {
+             return res.status(404).json({ error: 'Usuário não encontrado no servidor.' });
         }
 
+        // --- AÇÃO: BANIR (MODIFICADO: AGORA APENAS REMOVE ACESSOS/CARGOS) ---
+        if (action === 'ban') {
+            // Remove Cargo VIP
+            if (ROLE_CLIENT_ID) await member.roles.remove(ROLE_CLIENT_ID, reason).catch(e => logger.warn(`Erro remover VIP: ${e.message}`));
+            
+            // Remove Cargo Membro (Visitante)
+            if (ROLE_MEMBER_ID) await member.roles.remove(ROLE_MEMBER_ID, reason).catch(e => logger.warn(`Erro remover Membro: ${e.message}`));
+            
+            discordLog('🚫 Acesso Revogado (Role Strip)', `ID: ${discord_id}\nMotivo: ${reason}`, Colors.Red);
+            return res.json({ success: true, message: 'Usuário teve os cargos removidos (não banido).' });
+        }
+
+        // --- AÇÃO: REMOVER CARGO GENÉRICO ---
+        if (action === 'remove_role') {
+            if (!role_id) return res.status(400).json({ error: 'role_id é obrigatório para remover cargo.' });
+            
+            await member.roles.remove(role_id, reason);
+            discordLog('📉 Cargo Removido', `Usuário: ${member.user.tag}\nCargo ID: ${role_id}\nMotivo: ${reason}`, Colors.Orange);
+            return res.json({ success: true, message: 'Cargo removido com sucesso.' });
+        }
+        
+        // --- AÇÃO: ADICIONAR CARGO GENÉRICO ---
+        if (action === 'add_role') {
+            if (!role_id) return res.status(400).json({ error: 'role_id é obrigatório para adicionar cargo.' });
+            
+            await member.roles.add(role_id, reason);
+            discordLog('📈 Cargo Adicionado', `Usuário: ${member.user.tag}\nCargo ID: ${role_id}\nMotivo: ${reason}`, Colors.Green);
+            return res.json({ success: true, message: 'Cargo adicionado com sucesso.' });
+        }
+
+        // --- AÇÃO: REMOVER VIP (Legado / Padrão) ---
         if (action === 'remove_vip') {
             if (member && ROLE_CLIENT_ID) {
                 await member.roles.remove(ROLE_CLIENT_ID, reason);
