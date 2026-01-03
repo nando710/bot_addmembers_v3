@@ -20,9 +20,26 @@ const {
 //  CONFIGURAÇÃO DE LOGS (WINSTON)
 // =================================================================
 
-// Garante que a pasta de logs existe antes de iniciar
-if (!fs.existsSync('logs')) {
-    fs.mkdirSync('logs');
+// Lista inicial de onde os logs vão sair (pelo menos no Console)
+const logTransports = [
+    new winston.transports.Console()
+];
+
+// Tenta configurar logs em arquivo com tratamento de erro para evitar CRASH na VPS
+try {
+    // Garante que a pasta de logs existe antes de iniciar
+    if (!fs.existsSync('logs')) {
+        fs.mkdirSync('logs');
+    }
+    
+    // Se chegou aqui, a pasta existe ou foi criada com sucesso, então adiciona os arquivos
+    logTransports.push(new winston.transports.File({ filename: 'logs/error.log', level: 'error' }));
+    logTransports.push(new winston.transports.File({ filename: 'logs/combined.log' }));
+} catch (error) {
+    // Se der erro de permissão (comum no Coolify/Docker), avisa mas NÃO derruba o bot
+    console.error('⚠️ ALERTA DE SISTEMA: Não foi possível criar/acessar a pasta "logs".');
+    console.error(`📝 Motivo: ${error.message}`);
+    console.log('✅ O bot continuará rodando, mas os logs ficarão apenas neste Console (Memory Only).');
 }
 
 const logger = winston.createLogger({
@@ -31,11 +48,7 @@ const logger = winston.createLogger({
         winston.format.timestamp({ format: 'DD/MM/YYYY HH:mm:ss' }),
         winston.format.printf(({ timestamp, level, message }) => `[${timestamp}] ${level.toUpperCase()}: ${message}`)
     ),
-    transports: [
-        new winston.transports.Console(),
-        new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
-        new winston.transports.File({ filename: 'logs/combined.log' })
-    ],
+    transports: logTransports,
 });
 
 // =================================================================
@@ -107,7 +120,19 @@ app.get('/', (req, res) => res.send('Bot Online 🟢'));
 app.get('/login', (req, res) => {
     // Scopes necessários: identify (perfil), guilds.join (adicionar ao server), email
     const scopes = 'identify guilds.join email';
-    const url = `https://discord.com/api/oauth2/authorize?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&scope=${encodeURIComponent(scopes)}`;
+    
+    // Tratamento de erro: Limpa espaços em branco que podem vir do .env
+    const cleanRedirectUri = REDIRECT_URI ? REDIRECT_URI.trim() : '';
+    const cleanClientId = CLIENT_ID ? CLIENT_ID.trim() : '';
+
+    if (!cleanRedirectUri || !cleanClientId) {
+        logger.error('CONFIGURAÇÃO INVÁLIDA: CLIENT_ID ou REDIRECT_URI faltando no .env');
+        return res.status(500).send('Erro no Servidor: Configuração OAuth incompleta.');
+    }
+
+    logger.info(`Iniciando Login. Usando Redirect URI: ${cleanRedirectUri}`);
+
+    const url = `https://discord.com/api/oauth2/authorize?client_id=${cleanClientId}&redirect_uri=${encodeURIComponent(cleanRedirectUri)}&response_type=code&scope=${encodeURIComponent(scopes)}`;
     res.redirect(url);
 });
 
@@ -117,16 +142,21 @@ app.get('/callback', async (req, res) => {
 
     if (!code) return res.status(400).send('Código de autorização não fornecido.');
 
+    // Limpeza de variáveis para evitar erros de espaço
+    const cleanRedirectUri = REDIRECT_URI ? REDIRECT_URI.trim() : '';
+    const cleanClientId = CLIENT_ID ? CLIENT_ID.trim() : '';
+    const cleanClientSecret = CLIENT_SECRET ? CLIENT_SECRET.trim() : '';
+
     try {
         // Troca o código pelo token de acesso
         const tokenResponse = await axios.post(
             'https://discord.com/api/oauth2/token',
             new URLSearchParams({
-                client_id: CLIENT_ID,
-                client_secret: CLIENT_SECRET,
+                client_id: cleanClientId,
+                client_secret: cleanClientSecret,
                 grant_type: 'authorization_code',
                 code,
-                redirect_uri: REDIRECT_URI,
+                redirect_uri: cleanRedirectUri,
             }),
             { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
         );
@@ -141,24 +171,53 @@ app.get('/callback', async (req, res) => {
 
         logger.info(`Novo Login Web: ${userData.username} (${userData.id})`);
 
-        // Adiciona usuário ao Servidor (Guild)
+        // --- LÓGICA DE JOIN E CARGO APRIMORADA ---
+        
+        // 1. Prepara o payload do Join. Se tiver ROLE_MEMBER_ID, tenta dar direto no Join.
+        const joinBody = { access_token };
+        if (ROLE_MEMBER_ID) {
+            joinBody.roles = [ROLE_MEMBER_ID];
+        }
+
         try {
             await axios.put(
                 `https://discord.com/api/guilds/${GUILD_ID}/members/${userData.id}`,
-                { access_token },
+                joinBody,
                 { headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' } }
             );
         } catch (err) {
-            // Ignora erro se usuário já estiver no servidor
-            logger.warn(`Tentativa de adicionar usuário ao servidor: ${err.message}`);
+            // Ignora erro 204 (usuário já existe), loga outros
+            if (err.response && err.response.status !== 204) {
+                logger.warn(`API Join Warning: ${err.message}`);
+            }
         }
 
-        // Adiciona Cargo Inicial (Membro)
-        const guild = client.guilds.cache.get(GUILD_ID);
+        // 2. Fallback Seguro: Garante o cargo mesmo se o usuário já estava no servidor
+        // Tenta pegar a guild do cache ou fetch se não tiver
+        const guild = client.guilds.cache.get(GUILD_ID) || await client.guilds.fetch(GUILD_ID).catch(() => null);
+
         if (guild && ROLE_MEMBER_ID) {
-            const member = await guild.members.fetch(userData.id).catch(() => null);
-            if (member) {
-                await member.roles.add(ROLE_MEMBER_ID).catch(e => logger.error(`Erro ao dar cargo inicial: ${e.message}`));
+            try {
+                // Tenta buscar o membro. O fetch força verificar na API do Discord
+                let member = await guild.members.fetch(userData.id).catch(() => null);
+                
+                // Se não achou de primeira, espera 1 segundo (tempo de propagação) e tenta de novo
+                if (!member) {
+                    await new Promise(r => setTimeout(r, 1000));
+                    member = await guild.members.fetch(userData.id).catch(() => null);
+                }
+
+                if (member) {
+                    // Só tenta adicionar se ele AINDA NÃO tiver o cargo
+                    if (!member.roles.cache.has(ROLE_MEMBER_ID)) {
+                        await member.roles.add(ROLE_MEMBER_ID);
+                        logger.info(`Cargo MEMBRO COMUM adicionado para ${userData.username} (via fallback).`);
+                    }
+                } else {
+                    logger.warn(`ALERTA: Usuário ${userData.username} autenticou mas não foi encontrado no servidor para dar cargo.`);
+                }
+            } catch (roleError) {
+                logger.error(`Erro ao processar cargo de membro: ${roleError.message}`);
             }
         }
 
@@ -190,7 +249,10 @@ app.get('/callback', async (req, res) => {
 
     } catch (error) {
         logger.error(`Erro no Callback OAuth: ${error.message}`);
-        res.status(500).send('Erro na autenticação. Tente novamente.');
+        if (error.response) {
+            logger.error(`Discord API Error: ${JSON.stringify(error.response.data)}`);
+        }
+        res.status(500).send('Erro na autenticação. Verifique os logs do servidor.');
     }
 });
 
