@@ -1,46 +1,17 @@
 require('dotenv').config();
-const fs = require('fs'); // Módulo nativo para gerenciar arquivos
 const express = require('express');
 const axios = require('axios');
 const winston = require('winston');
-const { 
-    Client, 
-    GatewayIntentBits, 
-    ActionRowBuilder, 
-    ButtonBuilder, 
-    ButtonStyle, 
-    ChannelType, 
-    PermissionsBitField, 
-    EmbedBuilder, 
-    ComponentType,
-    Colors
-} = require('discord.js');
+const moment = require('moment');
+const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, PermissionsBitField, EmbedBuilder, ComponentType } = require('discord.js');
 
-// =================================================================
-//  CONFIGURAÇÃO DE LOGS (WINSTON)
-// =================================================================
+// --- INICIALIZAÇÕES ---
+const app = express();
+const port = process.env.PORT || 3000;
 
-// Garante que a pasta de logs existe antes de iniciar
-if (!fs.existsSync('logs')) {
-    fs.mkdirSync('logs');
-}
+// Permite JSON
+app.use(express.json());
 
-const logger = winston.createLogger({
-    level: 'info',
-    format: winston.format.combine(
-        winston.format.timestamp({ format: 'DD/MM/YYYY HH:mm:ss' }),
-        winston.format.printf(({ timestamp, level, message }) => `[${timestamp}] ${level.toUpperCase()}: ${message}`)
-    ),
-    transports: [
-        new winston.transports.Console(),
-        new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
-        new winston.transports.File({ filename: 'logs/combined.log' })
-    ],
-});
-
-// =================================================================
-//  INICIALIZAÇÃO DO CLIENTE DISCORD
-// =================================================================
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -50,231 +21,278 @@ const client = new Client({
     ]
 });
 
-// Variáveis de Ambiente
-const {
-    PORT = 3000,
-    CLIENT_ID,
-    CLIENT_SECRET,
-    BOT_TOKEN,
-    GUILD_ID,
-    REDIRECT_URI,
-    ADMIN_SECRET, // Senha para proteger seus webhooks
-    CATEGORY_TICKET_ID,
-    ROLE_MEMBER_ID, // Cargo dado no Login Web
-    ROLE_CLIENT_ID, // Cargo dado após validar Ticket/N8N
-    ROLE_SUPPORT_ID,
-    CHANNEL_TICKET_ID,
-    CHANNEL_LOG_ID,
-    N8N_WEBHOOK_AUTH, // URL do N8N para reportar login
-    N8N_WEBHOOK_VALIDATE // URL do N8N para validar ticket
-} = process.env;
+// --- VARIÁVEIS DE AMBIENTE ---
+const CLIENT_ID = process.env.CLIENT_ID;
+const CLIENT_SECRET = process.env.CLIENT_SECRET;
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const GUILD_ID = process.env.GUILD_ID;
+const REDIRECT_URI = process.env.REDIRECT_URI; 
+const ADMIN_SECRET = process.env.ADMIN_SECRET;
+
+// Variáveis dos Cargos e Tickets
+const CATEGORY_ID = process.env.CATEGORY_ID;         
+const SUPPORT_ROLE_ID = process.env.SUPPORT_ROLE_ID; 
+const ROLE_ID = process.env.ROLE_ID;                // Cargo Membro
+const CLIENT_ROLE_ID = process.env.CLIENT_ROLE_ID;  // Cargo VIP
+const TICKET_CHANNEL_ID = process.env.TICKET_CHANNEL_ID;
+const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID; // <--- NOVO: ID do canal de Logs
+
+// Webhooks (n8n)
+const WEBHOOK_AUTH_URL = process.env.MEU_WEBHOOK_URL;       
+const WEBHOOK_VALIDACAO_URL = process.env.WEBHOOK_VALIDACAO_URL;
 
 // =================================================================
-//  FUNÇÕES AUXILIARES
+//  SISTEMA DE LOGS (WINSTON + DISCORD)
 // =================================================================
 
-// Envia logs para um canal do Discord
-async function discordLog(title, description, color = Colors.Blue) {
-    if (!CHANNEL_LOG_ID) return;
+// Configuração do Winston (Logs em Arquivo e Console)
+const logger = winston.createLogger({
+    level: 'info',
+    format: winston.format.combine(
+        winston.format.timestamp({ format: 'DD/MM/YYYY HH:mm:ss' }),
+        winston.format.printf(({ timestamp, level, message }) => `[${timestamp}] ${level.toUpperCase()}: ${message}`)
+    ),
+    transports: [
+        new winston.transports.Console(),
+        new winston.transports.File({ filename: 'error.log', level: 'error' }), // Apenas erros
+        new winston.transports.File({ filename: 'combined.log' }) // Tudo
+    ],
+});
+
+// Função auxiliar para enviar logs para o canal do Discord
+async function discordLog(titulo, descricao, cor = '#5865F2', fields = []) {
+    if (!LOG_CHANNEL_ID) return; // Se não tiver canal configurado, ignora
+    if (!client.isReady()) return;
+
     try {
-        const channel = client.channels.cache.get(CHANNEL_LOG_ID);
-        if (!channel) return;
+        const canalLogs = client.channels.cache.get(LOG_CHANNEL_ID);
+        if (!canalLogs) return logger.warn(`Canal de logs (${LOG_CHANNEL_ID}) não encontrado.`);
 
         const embed = new EmbedBuilder()
-            .setTitle(title)
-            .setDescription(description.substring(0, 4000))
-            .setColor(color)
+            .setTitle(titulo)
+            .setDescription(descricao.substring(0, 4000)) // Limite do Discord
+            .setColor(cor)
             .setTimestamp()
-            .setFooter({ text: 'Sistema de Logs' });
+            .setFooter({ text: 'Sistema de Monitoramento' });
 
-        await channel.send({ embeds: [embed] });
+        if (fields.length > 0) embed.addFields(fields);
+
+        await canalLogs.send({ embeds: [embed] });
     } catch (error) {
         logger.error(`Falha ao enviar log para o Discord: ${error.message}`);
     }
 }
 
-// =================================================================
-//  SERVIDOR EXPRESS (WEB)
-// =================================================================
-const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Middleware para logar todas as requisições HTTP
+app.use((req, res, next) => {
+    logger.info(`HTTP Request: ${req.method} ${req.url} - IP: ${req.ip}`);
+    next();
+});
 
-// Rota Base
-app.get('/', (req, res) => res.send('Bot Online 🟢'));
+// =================================================================
+//  PARTE 1: SERVIDOR WEB 
+// =================================================================
 
-// 1. Rota de Login (Redireciona para o Discord)
+app.get('/', (req, res) => {
+    res.status(200).send('Bot Unificado Rodando 🚀');
+});
+
+// WEBHOOK DE BANIMENTO (Refund/Chargeback)
+app.post('/webhook/ban', async (req, res) => {
+    const { secret, discord_id, reason } = req.body;
+
+    logger.info(`Tentativa de BAN recebida via Webhook. ID: ${discord_id}`);
+
+    if (!ADMIN_SECRET || secret !== ADMIN_SECRET) {
+        logger.warn(`Tentativa de Ban não autorizada. Secret incorreto. IP: ${req.ip}`);
+        discordLog('🚨 Tentativa de Invasão', `Tentativa de acesso ao endpoint /webhook/ban com secret incorreto.\n**IP:** ${req.ip}`, '#FF0000');
+        return res.status(403).json({ error: "Acesso Negado: Secret incorreto." });
+    }
+
+    if (!discord_id) return res.status(400).json({ error: "Faltando discord_id." });
+
+    try {
+        const guild = client.guilds.cache.get(GUILD_ID);
+        if (!guild) throw new Error("Guild não encontrada no cache do Bot.");
+
+        // Tenta buscar o usuário antes de banir para pegar info (opcional)
+        let userTag = discord_id;
+        try { const u = await client.users.fetch(discord_id); userTag = u.tag; } catch(e){}
+
+        await guild.members.ban(discord_id, { reason: reason || 'Banimento automático (Refund)' });
+        
+        const msgSucesso = `🚫 USUÁRIO BANIDO: ${userTag} (${discord_id}) | Motivo: ${reason}`;
+        logger.info(msgSucesso);
+        discordLog('🔨 Banimento Automático', `**Usuário:** ${userTag}\n**ID:** ${discord_id}\n**Motivo:** ${reason}`, '#000000');
+
+        return res.json({ success: true, message: `Banido com sucesso.` });
+    } catch (error) {
+        logger.error(`Erro ao banir usuário ${discord_id}: ${error.message}`);
+        discordLog('❌ Erro no Banimento', `Falha ao banir ID ${discord_id}.\n**Erro:** ${error.message}`, '#FF0000');
+        return res.status(500).json({ error: "Erro ao banir.", details: error.message });
+    }
+});
+
+// ROTAS DE LOGIN
 app.get('/login', (req, res) => {
-    // Scopes necessários: identify (perfil), guilds.join (adicionar ao server), email
+    const emailDaCompra = req.query.email; 
+    if (!CLIENT_ID || !REDIRECT_URI) {
+        logger.error('Tentativa de login falhou: .env incompleto (CLIENT_ID ou REDIRECT_URI).');
+        return res.status(500).send('Erro interno de configuração.');
+    }
+
+    const stateData = emailDaCompra ? encodeURIComponent(emailDaCompra) : '';
     const scopes = 'identify guilds.join email';
-    const url = `https://discord.com/api/oauth2/authorize?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&scope=${encodeURIComponent(scopes)}`;
+    const url = `https://discord.com/api/oauth2/authorize?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&scope=${encodeURIComponent(scopes)}&state=${stateData}`;
     res.redirect(url);
 });
 
-// 2. Callback do Login (Processa o retorno do Discord)
 app.get('/callback', async (req, res) => {
-    const { code } = req.query;
+    const { code, state } = req.query; 
+    
+    if (!code) {
+        logger.warn('Callback chamado sem código.');
+        return res.send('Erro: Sem código do Discord.');
+    }
 
-    if (!code) return res.status(400).send('Código de autorização não fornecido.');
+    const emailCompraRecuperado = state ? decodeURIComponent(state) : "Não informado";
 
     try {
-        // Troca o código pelo token de acesso
-        const tokenResponse = await axios.post(
-            'https://discord.com/api/oauth2/token',
-            new URLSearchParams({
-                client_id: CLIENT_ID,
-                client_secret: CLIENT_SECRET,
-                grant_type: 'authorization_code',
-                code,
-                redirect_uri: REDIRECT_URI,
-            }),
-            { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-        );
+        const params = new URLSearchParams({
+            client_id: CLIENT_ID,
+            client_secret: CLIENT_SECRET,
+            grant_type: 'authorization_code',
+            code,
+            redirect_uri: REDIRECT_URI,
+        });
 
+        const tokenResponse = await axios.post('https://discord.com/api/oauth2/token', params, { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
         const { access_token } = tokenResponse.data;
 
-        // Pega dados do usuário
-        const userResponse = await axios.get('https://discord.com/api/users/@me', {
-            headers: { Authorization: `Bearer ${access_token}` }
-        });
+        const userResponse = await axios.get('https://discord.com/api/users/@me', { headers: { Authorization: `Bearer ${access_token}` } });
         const userData = userResponse.data;
 
-        logger.info(`Novo Login Web: ${userData.username} (${userData.id})`);
+        logger.info(`Login efetuado: ${userData.username} (${userData.id}) - Email Compra: ${emailCompraRecuperado}`);
+        
+        // Log no Discord de novo login
+        discordLog('🔐 Novo Login no Site', `**Usuário:** ${userData.username}\n**ID:** ${userData.id}\n**Email Discord:** ${userData.email}\n**Email Compra:** ${emailCompraRecuperado}`, '#00FF00');
 
-        // Adiciona usuário ao Servidor (Guild)
-        try {
-            await axios.put(
-                `https://discord.com/api/guilds/${GUILD_ID}/members/${userData.id}`,
-                { access_token },
-                { headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' } }
-            );
-        } catch (err) {
-            // Ignora erro se usuário já estiver no servidor
-            logger.warn(`Tentativa de adicionar usuário ao servidor: ${err.message}`);
-        }
+        // Entrar no Servidor + Cargo Membro
+        if (GUILD_ID) {
+            try {
+                await axios.put(
+                    `https://discord.com/api/guilds/${GUILD_ID}/members/${userData.id}`,
+                    { access_token: access_token }, 
+                    { headers: { 'Authorization': `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' } }
+                );
+                logger.info(`Usuário ${userData.username} adicionado à Guilda.`);
+            } catch (joinError) {
+                logger.warn(`Não foi possível adicionar ${userData.username} à guilda (talvez já esteja lá): ${joinError.message}`);
+            }
 
-        // Adiciona Cargo Inicial (Membro)
-        const guild = client.guilds.cache.get(GUILD_ID);
-        if (guild && ROLE_MEMBER_ID) {
-            const member = await guild.members.fetch(userData.id).catch(() => null);
-            if (member) {
-                await member.roles.add(ROLE_MEMBER_ID).catch(e => logger.error(`Erro ao dar cargo inicial: ${e.message}`));
+            if (ROLE_ID) {
+                try {
+                    const guild = client.guilds.cache.get(GUILD_ID);
+                    if (guild) {
+                        const member = await guild.members.fetch(userData.id).catch(() => null);
+                        if (member) {
+                            // Só adiciona se não tiver o VIP ainda, ou se for lógica de entrada padrão
+                            await member.roles.add(ROLE_ID);
+                            logger.info(`Cargo inicial adicionado para ${userData.username}`);
+                        }
+                    }
+                } catch (roleError) { 
+                    logger.error(`Erro ao dar cargo inicial para ${userData.username}: ${roleError.message}`);
+                }
             }
         }
 
-        // Notifica N8N sobre o login
-        if (N8N_WEBHOOK_AUTH) {
-            axios.post(N8N_WEBHOOK_AUTH, {
-                event: 'web_login',
+        // Webhook n8n
+        if (WEBHOOK_AUTH_URL) {
+            axios.post(WEBHOOK_AUTH_URL, {
+                tipo: "LOGIN_SITE",
+                email_compra: emailCompraRecuperado,
                 discord_id: userData.id,
                 username: userData.username,
-                email: userData.email,
-                timestamp: new Date().toISOString()
-            }).catch(() => null);
+                email_discord: userData.email,
+                data: new Date().toISOString()
+            }).catch(e => logger.error(`Erro ao enviar webhook auth n8n: ${e.message}`));
         }
 
-        // Página de Sucesso Bonita
+        // --- TELA DE SUCESSO ---
+        const discordRedirectUrl = `https://discord.com/channels/${GUILD_ID}`;
+        
         res.send(`
-            <html>
-                <body style="background:#2c2f33;color:white;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;">
-                    <div style="text-align:center;background:#23272a;padding:40px;border-radius:10px;">
-                        <h1 style="color:#5865F2">Sucesso! 🚀</h1>
-                        <p>Você foi autenticado e adicionado ao servidor.</p>
-                        <p>Pode fechar esta janela.</p>
-                    </div>
-                </body>
+            <!DOCTYPE html>
+            <html lang="pt-BR">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Sucesso!</title>
+                <style>
+                    body { background-color: #2c2f33; color: white; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+                    .box { background: #23272a; padding: 40px; border-radius: 10px; text-align: center; box-shadow: 0 4px 15px rgba(0,0,0,0.3); max-width: 90%; }
+                    h1 { color: #5865F2; margin-bottom: 10px; }
+                    p { color: #b9bbbe; margin-bottom: 20px; }
+                    .btn { background: #5865F2; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; font-weight: bold; display: inline-block; margin-top: 10px; transition: background 0.2s; }
+                    .btn:hover { background: #4752c4; }
+                    .loader { border: 4px solid #f3f3f3; border-top: 4px solid #5865F2; border-radius: 50%; width: 20px; height: 20px; animation: spin 1s linear infinite; margin: 15px auto; }
+                    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+                </style>
+            </head>
+            <body>
+                <div class="box">
+                    <h1>Tudo certo! 🎉</h1>
+                    <p>Sua conta foi vinculada com sucesso.</p>
+                    <div class="loader"></div>
+                    <p style="font-size: 14px;">Levando você para o Discord...</p>
+                    <a href="${discordRedirectUrl}" class="btn">Abrir Discord Agora</a>
+                </div>
+                <script>
+                    setTimeout(function() { window.location.href = "${discordRedirectUrl}"; }, 3000);
+                </script>
+            </body>
             </html>
         `);
 
-        discordLog('🔐 Login Web Efetuado', `Usuário: **${userData.username}**\nID: \`${userData.id}\`\nEmail: ||${userData.email}||`, Colors.Green);
-
     } catch (error) {
-        logger.error(`Erro no Callback OAuth: ${error.message}`);
+        logger.error(`Erro Callback OAuth: ${error.message}`);
+        if(error.response) logger.error(`Detalhes OAuth: ${JSON.stringify(error.response.data)}`);
+        
+        discordLog('❌ Erro no Login', `Erro ao processar callback de login.\n**Erro:** ${error.message}`, '#FF0000');
         res.status(500).send('Erro na autenticação. Tente novamente.');
     }
 });
 
-// 3. Webhook de Gestão (Recebe do N8N para Banir ou Remover Cargo)
-app.post('/webhook/manage-user', async (req, res) => {
-    const { secret, action, discord_id, reason } = req.body;
-
-    // Segurança Básica
-    if (secret !== ADMIN_SECRET) {
-        logger.warn(`Tentativa de acesso não autorizado ao webhook por ${req.ip}`);
-        return res.status(403).json({ error: 'Acesso negado (Token inválido)' });
-    }
-
-    if (!discord_id || !action) {
-        return res.status(400).json({ error: 'Dados incompletos (discord_id e action são obrigatórios)' });
-    }
-
-    const guild = client.guilds.cache.get(GUILD_ID);
-    if (!guild) return res.status(500).json({ error: 'Bot não está no servidor configurado.' });
-
-    try {
-        const member = await guild.members.fetch(discord_id).catch(() => null);
-
-        if (action === 'ban') {
-            await guild.members.ban(discord_id, { reason: reason || 'Banimento via Webhook (Sistema)' });
-            discordLog('🔨 Usuário Banido', `ID: ${discord_id}\nMotivo: ${reason}`, Colors.Red);
-            return res.json({ success: true, message: 'Usuário banido.' });
-        }
-
-        if (action === 'remove_vip') {
-            if (member && ROLE_CLIENT_ID) {
-                await member.roles.remove(ROLE_CLIENT_ID, reason);
-                discordLog('📉 VIP Removido', `Usuário: ${member.user.tag}\nMotivo: ${reason}`, Colors.Orange);
-                return res.json({ success: true, message: 'Cargo removido.' });
-            } else {
-                return res.status(404).json({ error: 'Membro não encontrado ou cargo não configurado.' });
-            }
-        }
-
-        return res.status(400).json({ error: 'Ação desconhecida.' });
-
-    } catch (error) {
-        logger.error(`Erro no Webhook Manage: ${error.message}`);
-        return res.status(500).json({ error: error.message });
-    }
+app.listen(port, () => {
+    logger.info(`🌍 Servidor Web rodando na porta ${port}`);
 });
-
-// Inicia Servidor Web
-app.listen(PORT, () => logger.info(`🌍 Servidor Web rodando na porta ${PORT}`));
 
 
 // =================================================================
-//  LÓGICA DO BOT DISCORD
+//  PARTE 2: CLIENTE DISCORD 
 // =================================================================
 
 client.on('ready', async () => {
-    logger.info(`🤖 Bot logado como ${client.user.tag}`);
+    logger.info(`🤖 Bot Discord Logado: ${client.user.tag}`);
+    discordLog('🟢 Bot Iniciado', `O sistema foi reiniciado e está online.\n**Log Channel:** <#${LOG_CHANNEL_ID}>`, '#00FF00');
     
-    // Configura/Verifica Painel de Tickets
-    if (CHANNEL_TICKET_ID) {
-        const channel = client.channels.cache.get(CHANNEL_TICKET_ID);
-        if (channel) {
-            // Busca mensagens antigas para não duplicar o painel
-            const messages = await channel.messages.fetch({ limit: 5 });
-            const hasPanel = messages.find(m => m.author.id === client.user.id && m.embeds.length > 0);
-
-            if (!hasPanel) {
-                const embed = new EmbedBuilder()
-                    .setTitle('Validação de Cliente')
-                    .setDescription('Para liberar seu acesso VIP, clique no botão abaixo e informe o e-mail da compra.')
-                    .setColor(Colors.Gold)
-                    .setFooter({ text: 'Suporte Automatizado' });
-
-                const row = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder()
-                        .setCustomId('open_ticket')
-                        .setLabel('Validar Compra')
-                        .setEmoji('💎')
-                        .setStyle(ButtonStyle.Success)
-                );
-
-                await channel.send({ embeds: [embed], components: [row] });
-                logger.info('Painel de tickets criado.');
-            }
+    if (TICKET_CHANNEL_ID) {
+        const canalTickets = client.channels.cache.get(TICKET_CHANNEL_ID);
+        if (canalTickets) {
+            try {
+                const ultimasMensagens = await canalTickets.messages.fetch({ limit: 1 });
+                const ultimaMsg = ultimasMensagens.first();
+                
+                if (!ultimaMsg || ultimaMsg.author.id !== client.user.id) {
+                    const embed = new EmbedBuilder().setColor('#0099ff').setTitle('Validação de Acesso VIP').setDescription('Clique abaixo para validar sua compra.');
+                    const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('abrir_ticket').setLabel('Validar Compra').setEmoji('💎').setStyle(ButtonStyle.Success));
+                    await canalTickets.send({ embeds: [embed], components: [row] });
+                    logger.info('Painel de tickets postado/atualizado.');
+                }
+            } catch (e) { logger.error(`Erro ao postar painel tickets: ${e.message}`); }
+        } else {
+            logger.warn('Canal de Tickets não encontrado (TICKET_CHANNEL_ID inválido).');
         }
     }
 });
@@ -282,157 +300,133 @@ client.on('ready', async () => {
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isButton()) return;
 
-    // --- ABRIR TICKET ---
-    if (interaction.customId === 'open_ticket') {
-        const channelName = `ticket-${interaction.user.username}`.toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 25);
-        
-        // Verifica se já existe
-        const existingChannel = interaction.guild.channels.cache.find(c => c.name === channelName && c.parentId === CATEGORY_TICKET_ID);
-        if (existingChannel) {
-            return interaction.reply({ content: `Você já possui um ticket aberto: ${existingChannel}`, ephemeral: true });
-        }
+    if (interaction.customId === 'abrir_ticket') {
+        const nomeCanal = `ticket-${interaction.user.username.toLowerCase().replace(/[^a-z0-9]/g, '')}`;
+        const jaTemTicket = interaction.guild.channels.cache.find(c => c.name === nomeCanal);
+        if (jaTemTicket) return interaction.reply({ content: `⚠️ Você já tem um ticket: ${jaTemTicket}`, ephemeral: true });
 
         await interaction.deferReply({ ephemeral: true });
 
         try {
-            const ticketChannel = await interaction.guild.channels.create({
-                name: channelName,
+            const canal = await interaction.guild.channels.create({
+                name: nomeCanal,
                 type: ChannelType.GuildText,
-                parent: CATEGORY_TICKET_ID,
+                parent: CATEGORY_ID,
                 permissionOverwrites: [
                     { id: interaction.guild.id, deny: [PermissionsBitField.Flags.ViewChannel] },
                     { id: interaction.user.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages] },
-                    { id: ROLE_SUPPORT_ID, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages] },
+                    { id: SUPPORT_ROLE_ID, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages] },
                     { id: client.user.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages] }
                 ]
             });
 
-            await interaction.editReply({ content: `✅ Ticket criado: ${ticketChannel}` });
-
-            const welcomeEmbed = new EmbedBuilder()
-                .setTitle(`Olá, ${interaction.user.username}!`)
-                .setDescription('Por favor, **digite o E-MAIL** utilizado na compra para liberarmos seu acesso.\n\nCaso queira cancelar, clique em fechar.')
-                .setColor(Colors.Blue);
-
-            const closeBtn = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId('close_ticket').setLabel('Fechar Ticket').setStyle(ButtonStyle.Danger)
-            );
-
-            await ticketChannel.send({ content: `<@${interaction.user.id}>`, embeds: [welcomeEmbed], components: [closeBtn] });
-
-            // Inicia o coletor de e-mail
-            handleTicketEmailCollection(ticketChannel, interaction.user);
+            await interaction.editReply({ content: `✅ Ticket criado: ${canal}` });
+            const embed = new EmbedBuilder().setTitle(`Olá, ${interaction.user.username}`).setDescription('**Digite o E-MAIL usado na compra:**').setColor('#f1c40f');
+            const btn = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('fechar_ticket').setLabel('Fechar').setStyle(ButtonStyle.Danger));
+            await canal.send({ content: `<@${interaction.user.id}>`, embeds: [embed], components: [btn] });
+            
+            logger.info(`Ticket criado: ${nomeCanal} por ${interaction.user.tag}`);
+            iniciarColetaDeEmail(canal, interaction.user);
 
         } catch (error) {
             logger.error(`Erro ao criar ticket: ${error.message}`);
-            interaction.editReply('Erro ao criar o ticket. Avise um administrador.');
+            discordLog('⚠️ Erro Ticket', `Falha ao criar ticket para ${interaction.user.tag}.\n**Erro:** ${error.message}`, '#FFA500');
+            await interaction.editReply('❌ Erro ao criar ticket. Contate o suporte.');
         }
     }
 
-    // --- FECHAR TICKET ---
-    if (interaction.customId === 'close_ticket') {
-        if (!interaction.channel.name.startsWith('ticket-')) return;
-        await interaction.reply('Fechando ticket em 5 segundos...');
-        setTimeout(() => interaction.channel.delete().catch(() => {}), 5000);
+    if (interaction.customId === 'fechar_ticket') {
+        await interaction.reply('Encerrando...');
+        logger.info(`Ticket fechado por ${interaction.user.tag}`);
+        setTimeout(() => interaction.channel?.delete().catch(() => {}), 3000);
     }
 });
 
-// Função para Coletar E-mail dentro do Ticket
-function handleTicketEmailCollection(channel, user) {
-    const filter = m => m.author.id === user.id && !m.author.bot;
-    const collector = channel.createMessageCollector({ filter, time: 300000 }); // 5 minutos
+function iniciarColetaDeEmail(canal, usuario) {
+    const filter = m => m.author.id === usuario.id;
+    const collector = canal.createMessageCollector({ filter, max: 1 });
 
-    collector.on('collect', async (message) => {
-        const email = message.content.trim();
-        
-        // Validação simples de regex de email
-        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-        if (!emailRegex.test(email)) {
-            return channel.send('⚠️ Formato de e-mail inválido. Tente novamente.');
-        }
-
-        // Pausa o coletor para confirmação
-        // collector.stop('confirmation'); 
-
-        const confirmRow = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`confirm_yes_${email}`).setLabel('Confirmar').setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId('confirm_no').setLabel('Cancelar/Corrigir').setStyle(ButtonStyle.Secondary)
+    collector.on('collect', async (msg) => {
+        const email = msg.content.trim();
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('sim').setLabel('Confirmar').setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId('nao').setLabel('Corrigir').setStyle(ButtonStyle.Secondary)
         );
 
-        const msgConfirm = await channel.send({ 
-            content: `Você digitou: **${email}**. Está correto?`, 
-            components: [confirmRow] 
-        });
+        const msgConf = await canal.send({ content: `E-mail: **${email}**. Confirma?`, components: [row] });
+        const btnCol = msgConf.createMessageComponentCollector({ componentType: ComponentType.Button, time: 60000 });
 
-        // Coletor para os botões de confirmação
-        const btnCollector = msgConfirm.createMessageComponentCollector({ componentType: ComponentType.Button, time: 60000 });
-
-        btnCollector.on('collect', async (i) => {
-            if (i.user.id !== user.id) return;
-
-            if (i.customId === 'confirm_no') {
-                await i.update({ content: 'Ok, digite o e-mail novamente abaixo.', components: [] });
-                return; // O message collector principal continua rodando
-            }
-
-            if (i.customId.startsWith('confirm_yes_')) {
-                await i.update({ content: `🔄 Verificando **${email}** no sistema... Aguarde.`, components: [] });
-                collector.stop(); // Para de ouvir novas mensagens
-
-                // --- CHAMADA AO N8N ---
-                if (!N8N_WEBHOOK_VALIDATE) {
-                    return channel.send('❌ Erro: Webhook de validação não configurado no .env.');
-                }
-
+        btnCol.on('collect', async (i) => {
+            if (i.user.id !== usuario.id) return;
+            if (i.customId === 'sim') {
+                await i.update({ content: `🔄 Validando **${email}**...`, components: [] });
+                
                 try {
-                    const response = await axios.post(N8N_WEBHOOK_VALIDATE, {
-                        email: email,
-                        discord_id: user.id,
-                        username: user.username,
-                        ticket_channel: channel.id
-                    });
+                    logger.info(`Validando email ${email} para usuário ${usuario.tag}`);
+                    const resp = await axios.post(WEBHOOK_VALIDACAO_URL, { tipo: "VALIDACAO_TICKET", email: email, discord_id: usuario.id, username: usuario.username });
+                    
+                    const texto = resp.data.reply || "Processado.";
+                    const aprovado = resp.data.approved === true;
+                    
+                    await canal.send({ embeds: [new EmbedBuilder().setDescription(texto).setColor(aprovado ? '#00FF00' : '#FF0000')] });
+                    
+                    if (aprovado) {
+                        logger.info(`Validação APROVADA: ${email} - ${usuario.tag}`);
+                        discordLog('💎 VIP Entregue', `**User:** ${usuario.tag}\n**Email:** ${email}`, '#00FFFF');
 
-                    // Espera que o N8N retorne { approved: true, message: "..." }
-                    const { approved, message } = response.data;
+                        if (CLIENT_ROLE_ID) {
+                            try {
+                                const member = await canal.guild.members.fetch(usuario.id);
+                                await member.roles.add(CLIENT_ROLE_ID);
+                                await canal.send(`🎉 Cargo <@&${CLIENT_ROLE_ID}> entregue!`);
 
-                    if (approved) {
-                        const member = await channel.guild.members.fetch(user.id);
-                        if (ROLE_CLIENT_ID) await member.roles.add(ROLE_CLIENT_ID);
-                        
-                        const successEmbed = new EmbedBuilder()
-                            .setTitle('✅ Acesso Liberado!')
-                            .setDescription(message || 'Sua compra foi validada e seu cargo foi entregue.')
-                            .setColor(Colors.Green);
-                        
-                        await channel.send({ embeds: [successEmbed] });
-                        discordLog('💎 Ticket Validado', `User: ${user.tag}\nEmail: ${email}`, Colors.Green);
-                        
-                        // Opcional: Fechar ticket automaticamente após sucesso
-                        setTimeout(() => channel.send('Este ticket será fechado em 10 segundos...'), 2000);
-                        setTimeout(() => channel.delete().catch(()=>{}), 12000);
+                                // --- REMOVE O CARGO COMUM SE EXISTIR ---
+                                if (ROLE_ID) {
+                                    try {
+                                        if (member.roles.cache.has(ROLE_ID)) {
+                                            await member.roles.remove(ROLE_ID);
+                                            logger.info(`Cargo comum (Membro) removido de ${usuario.tag} após virar VIP.`);
+                                        }
+                                    } catch (removeError) {
+                                        logger.error(`Erro ao remover cargo comum de ${usuario.tag}: ${removeError.message}`);
+                                    }
+                                }
 
+                            } catch (e) { 
+                                logger.error(`Erro ao dar cargo VIP: ${e.message}`);
+                                await canal.send(`⚠️ Erro ao entregar cargo automático.`);
+                            }
+                        }
                     } else {
-                        await channel.send({ 
-                            embeds: [new EmbedBuilder().setTitle('❌ Negado').setDescription(message || 'E-mail não encontrado ou compra reembolsada.').setColor(Colors.Red)] 
-                        });
-                        discordLog('🚫 Validação Falhou', `User: ${user.tag}\nEmail: ${email}\nMotivo: ${message}`, Colors.Red);
+                        logger.warn(`Validação RECUSADA: ${email} - ${usuario.tag}`);
                     }
 
-                } catch (err) {
-                    logger.error(`Erro ao chamar N8N: ${err.message}`);
-                    channel.send('❌ Erro de comunicação com o servidor. Tente mais tarde.');
+                } catch (e) { 
+                    logger.error(`Erro API Validação (n8n): ${e.message}`);
+                    await canal.send('❌ Erro de comunicação com o servidor de validação.');
                 }
+                btnCol.stop();
+            } else {
+                await i.update({ content: '⚠️ Digite o e-mail novamente:', components: [] });
+                iniciarColetaDeEmail(canal, usuario);
+                btnCol.stop();
             }
         });
     });
 }
 
-// Anti-Crash Global
-process.on('unhandledRejection', (reason, p) => {
-    logger.error(`[Anti-Crash] Rejeição não tratada: ${reason}`);
+// =================================================================
+//  ANTI-CRASH (Evita que o bot caia por erros bobos)
+// =================================================================
+
+process.on('unhandledRejection', (reason, promise) => {
+    logger.error(`Unhandled Rejection: ${reason}`);
+    discordLog('☠️ Unhandled Rejection', `\`\`\`js\n${reason}\n\`\`\``, '#FF0000');
 });
-process.on('uncaughtException', (err, origin) => {
-    logger.error(`[Anti-Crash] Exceção não capturada: ${err}`);
+
+process.on('uncaughtException', (error) => {
+    logger.error(`Uncaught Exception: ${error.message}`);
+    discordLog('☠️ Uncaught Exception', `\`\`\`js\n${error.stack}\n\`\`\``, '#FF0000');
 });
 
 client.login(BOT_TOKEN);
