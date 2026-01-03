@@ -1,0 +1,33 @@
+Dependências do Node (Pesado, não subir)
+
+node_modules/
+
+Arquivos de Ambiente (Segurança, não subir senhas)
+
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+
+Logs (Gerados durante o uso)
+
+logs/
+.log
+npm-debug.log
+yarn-debug.log*
+yarn-error.log*
+
+Arquivos de Sistema Operacional (Lixo)
+
+.DS_Store
+Thumbs.db
+
+Pastas de cobertura de testes (se houver)
+
+coverage/
+
+Pastas de build (opcional, caso use TypeScript no futuro)
+
+dist/
+build/
