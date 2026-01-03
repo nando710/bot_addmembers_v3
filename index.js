@@ -121,6 +121,9 @@ app.get('/', (req, res) => res.send('Bot Online 🟢'));
 
 // 1. Rota de Login (Redireciona para o Discord)
 app.get('/login', (req, res) => {
+    // Recupera o email passado na URL (ex: ?email=cliente@gmail.com)
+    const emailCompra = req.query.email || '';
+
     // Scopes necessários: identify (perfil), guilds.join (adicionar ao server), email
     const scopes = 'identify guilds.join email';
     
@@ -133,17 +136,23 @@ app.get('/login', (req, res) => {
         return res.status(500).send('Erro no Servidor: Configuração OAuth incompleta.');
     }
 
-    logger.info(`Iniciando Login. Usando Redirect URI: ${cleanRedirectUri}`);
+    logger.info(`Iniciando Login. Usando Redirect URI: ${cleanRedirectUri} | Email Compra: ${emailCompra}`);
 
-    const url = `https://discord.com/api/oauth2/authorize?client_id=${cleanClientId}&redirect_uri=${encodeURIComponent(cleanRedirectUri)}&response_type=code&scope=${encodeURIComponent(scopes)}`;
+    // Adiciona o email no parametro 'state' para recuperar depois no callback
+    const state = encodeURIComponent(emailCompra);
+
+    const url = `https://discord.com/api/oauth2/authorize?client_id=${cleanClientId}&redirect_uri=${encodeURIComponent(cleanRedirectUri)}&response_type=code&scope=${encodeURIComponent(scopes)}&state=${state}`;
     res.redirect(url);
 });
 
 // 2. Callback do Login (Processa o retorno do Discord)
 app.get('/callback', async (req, res) => {
-    const { code } = req.query;
+    const { code, state } = req.query; // Recupera o 'state' (onde guardamos o email)
 
     if (!code) return res.status(400).send('Código de autorização não fornecido.');
+
+    // Decodifica o email da compra que veio no state
+    const emailCompra = state ? decodeURIComponent(state) : null;
 
     // Limpeza de variáveis para evitar erros de espaço
     const cleanRedirectUri = REDIRECT_URI ? REDIRECT_URI.trim() : '';
@@ -172,7 +181,7 @@ app.get('/callback', async (req, res) => {
         });
         const userData = userResponse.data;
 
-        logger.info(`Novo Login Web: ${userData.username} (${userData.id})`);
+        logger.info(`Novo Login Web: ${userData.username} (${userData.id}) - Email Compra Detectado: ${emailCompra || 'Nenhum'}`);
 
         // --- LÓGICA DE JOIN E CARGO APRIMORADA ---
         
@@ -224,13 +233,14 @@ app.get('/callback', async (req, res) => {
             }
         }
 
-        // Notifica N8N sobre o login
+        // Notifica N8N sobre o login (Agora incluindo o email_compra)
         if (N8N_WEBHOOK_AUTH) {
             axios.post(N8N_WEBHOOK_AUTH, {
                 event: 'web_login',
                 discord_id: userData.id,
                 username: userData.username,
-                email: userData.email,
+                email: userData.email, // Email da conta do Discord
+                email_compra: emailCompra, // Email vindo da URL do site
                 timestamp: new Date().toISOString()
             }).catch(() => null);
         }
@@ -248,7 +258,7 @@ app.get('/callback', async (req, res) => {
             </html>
         `);
 
-        discordLog('🔐 Login Web Efetuado', `Usuário: **${userData.username}**\nID: \`${userData.id}\`\nEmail: ||${userData.email}||`, Colors.Green);
+        discordLog('🔐 Login Web Efetuado', `Usuário: **${userData.username}**\nID: \`${userData.id}\`\nEmail Discord: ||${userData.email}||\nEmail Compra: ||${emailCompra || 'Não informado'}||`, Colors.Green);
 
     } catch (error) {
         logger.error(`Erro no Callback OAuth: ${error.message}`);
@@ -414,6 +424,32 @@ client.on('interactionCreate', async (interaction) => {
             );
 
             await ticketChannel.send({ content: `<@${interaction.user.id}>`, embeds: [welcomeEmbed], components: [btnRow] });
+
+            // ============================================
+            //  MONITORAMENTO DE INATIVIDADE (3 MINUTOS)
+            // ============================================
+            const collector = ticketChannel.createMessageComponentCollector({ 
+                componentType: ComponentType.Button, 
+                idle: 180_000 // 3 minutos de inatividade (180.000 ms)
+            });
+
+            collector.on('collect', i => {
+                // Apenas observar a interação reseta o timer 'idle' automaticamente
+            });
+
+            collector.on('end', async (collected, reason) => {
+                if (reason === 'idle') {
+                    try {
+                        const ch = interaction.guild.channels.cache.get(ticketChannel.id);
+                        if (ch) {
+                            await ch.send('⏳ **Ticket encerrado automaticamente por inatividade (3 min).**');
+                            setTimeout(() => ch.delete().catch(() => {}), 5000);
+                        }
+                    } catch (e) {
+                        logger.error(`Erro ao fechar ticket por inatividade: ${e.message}`);
+                    }
+                }
+            });
 
         } catch (error) {
             logger.error(`Erro ao criar ticket: ${error.message}`);
