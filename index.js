@@ -13,7 +13,10 @@ const {
     PermissionsBitField, 
     EmbedBuilder, 
     ComponentType,
-    Colors
+    Colors,
+    ModalBuilder,
+    TextInputBuilder,
+    TextInputStyle
 } = require('discord.js');
 
 // =================================================================
@@ -342,13 +345,42 @@ client.on('ready', async () => {
 });
 
 client.on('interactionCreate', async (interaction) => {
+    // =================================================================
+    //  TRATAMENTO DE MODAL (FORMULÁRIO DE EMAIL)
+    // =================================================================
+    if (interaction.isModalSubmit()) {
+        if (interaction.customId === 'modal_email_validation') {
+            const email = interaction.fields.getTextInputValue('email_input');
+            
+            // Validação simples de regex
+            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+            if (!emailRegex.test(email)) {
+                return interaction.reply({ content: '⚠️ Formato de e-mail inválido. Clique em "Iniciar Validação" novamente.', ephemeral: true });
+            }
+
+            const confirmRow = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId('confirm_yes').setLabel('Confirmar').setStyle(ButtonStyle.Success),
+                new ButtonBuilder().setCustomId('confirm_no').setLabel('Corrigir').setStyle(ButtonStyle.Secondary)
+            );
+
+            // Manda mensagem perguntando se está certo
+            await interaction.reply({ 
+                content: `Você digitou: **${email}**. Está correto?`, 
+                components: [confirmRow]
+            });
+        }
+        return;
+    }
+
+    // =================================================================
+    //  TRATAMENTO DE BOTÕES
+    // =================================================================
     if (!interaction.isButton()) return;
 
-    // --- ABRIR TICKET ---
+    // --- ABRIR TICKET (CRIAÇÃO DO CANAL) ---
     if (interaction.customId === 'open_ticket') {
         const channelName = `ticket-${interaction.user.username}`.toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 25);
         
-        // Verifica se já existe
         const existingChannel = interaction.guild.channels.cache.find(c => c.name === channelName && c.parentId === CATEGORY_TICKET_ID);
         if (existingChannel) {
             return interaction.reply({ content: `Você já possui um ticket aberto: ${existingChannel}`, ephemeral: true });
@@ -373,21 +405,103 @@ client.on('interactionCreate', async (interaction) => {
 
             const welcomeEmbed = new EmbedBuilder()
                 .setTitle(`Olá, ${interaction.user.username}!`)
-                .setDescription('Por favor, **digite o E-MAIL** utilizado na compra para liberarmos seu acesso.\n\nCaso queira cancelar, clique em fechar.')
+                .setDescription('Para liberar seu acesso, clique no botão **"Iniciar Validação"** abaixo e informe seu e-mail.\n\nCaso queira cancelar, clique em fechar.')
                 .setColor(Colors.Blue);
 
-            const closeBtn = new ActionRowBuilder().addComponents(
+            const btnRow = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId('start_validation').setLabel('Iniciar Validação').setEmoji('📧').setStyle(ButtonStyle.Primary),
                 new ButtonBuilder().setCustomId('close_ticket').setLabel('Fechar Ticket').setStyle(ButtonStyle.Danger)
             );
 
-            await ticketChannel.send({ content: `<@${interaction.user.id}>`, embeds: [welcomeEmbed], components: [closeBtn] });
-
-            // Inicia o coletor de e-mail
-            handleTicketEmailCollection(ticketChannel, interaction.user);
+            await ticketChannel.send({ content: `<@${interaction.user.id}>`, embeds: [welcomeEmbed], components: [btnRow] });
 
         } catch (error) {
             logger.error(`Erro ao criar ticket: ${error.message}`);
             interaction.editReply('Erro ao criar o ticket. Avise um administrador.');
+        }
+    }
+
+    // --- INICIAR VALIDAÇÃO (ABRIR MODAL) ---
+    if (interaction.customId === 'start_validation') {
+        const modal = new ModalBuilder()
+            .setCustomId('modal_email_validation')
+            .setTitle('Validação de Compra');
+
+        const emailInput = new TextInputBuilder()
+            .setCustomId('email_input')
+            .setLabel("Qual o e-mail da compra?")
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('exemplo@email.com')
+            .setRequired(true);
+
+        const firstActionRow = new ActionRowBuilder().addComponents(emailInput);
+        modal.addComponents(firstActionRow);
+
+        await interaction.showModal(modal);
+    }
+
+    // --- BOTÕES DE CONFIRMAÇÃO (YES/NO) ---
+    if (interaction.customId === 'confirm_no') {
+        await interaction.update({ content: 'Ok, clique em **"Iniciar Validação"** novamente para corrigir.', components: [] });
+    }
+
+    if (interaction.customId === 'confirm_yes') {
+        // Recupera o email da própria mensagem do bot ("Você digitou: **email**...")
+        const match = interaction.message.content.match(/\*\*(.*?)\*\*/);
+        const email = match ? match[1] : null;
+
+        if (!email) {
+            return interaction.update({ content: '❌ Erro ao recuperar e-mail. Tente novamente.', components: [] });
+        }
+
+        await interaction.update({ content: `🔄 Verificando **${email}** no sistema... Aguarde.`, components: [] });
+
+        // --- CHAMADA AO N8N ---
+        if (!N8N_WEBHOOK_VALIDATE) {
+            return interaction.followUp({ content: '❌ Erro: Webhook de validação não configurado.', ephemeral: true });
+        }
+
+        try {
+            const response = await axios.post(N8N_WEBHOOK_VALIDATE, {
+                email: email,
+                discord_id: interaction.user.id,
+                username: interaction.user.username,
+                ticket_channel: interaction.channelId
+            });
+
+            const { approved, message } = response.data;
+            const ticketChannel = interaction.channel;
+
+            if (approved) {
+                const member = await interaction.guild.members.fetch(interaction.user.id);
+                
+                if (ROLE_CLIENT_ID) await member.roles.add(ROLE_CLIENT_ID);
+                
+                if (ROLE_MEMBER_ID) {
+                    await member.roles.remove(ROLE_MEMBER_ID).catch(e => logger.warn(`Erro ao remover cargo comum: ${e.message}`));
+                }
+                
+                const successEmbed = new EmbedBuilder()
+                    .setTitle('✅ Acesso Liberado!')
+                    .setDescription(message || 'Sua compra foi validada e seu cargo foi entregue.')
+                    .setColor(Colors.Green);
+                
+                await ticketChannel.send({ embeds: [successEmbed] });
+                discordLog('💎 Ticket Validado', `User: ${interaction.user.tag}\nEmail: ${email}`, Colors.Green);
+                
+                setTimeout(() => ticketChannel.send('Este ticket será fechado em 10 segundos...'), 2000);
+                setTimeout(() => ticketChannel.delete().catch(()=>{}), 12000);
+
+            } else {
+                await ticketChannel.send({ 
+                    embeds: [new EmbedBuilder().setTitle('❌ Negado').setDescription(message || 'E-mail não encontrado.').setColor(Colors.Red)] 
+                });
+                discordLog('🚫 Validação Falhou', `User: ${interaction.user.tag}\nEmail: ${email}\nMotivo: ${message}`, Colors.Red);
+            }
+
+        } catch (err) {
+            logger.error(`Erro ao chamar N8N: ${err.message}`);
+            interaction.followUp('❌ Erro de comunicação com o servidor. Tente mais tarde.');
         }
     }
 
@@ -398,103 +512,6 @@ client.on('interactionCreate', async (interaction) => {
         setTimeout(() => interaction.channel.delete().catch(() => {}), 5000);
     }
 });
-
-// Função para Coletar E-mail dentro do Ticket
-function handleTicketEmailCollection(channel, user) {
-    const filter = m => m.author.id === user.id && !m.author.bot;
-    const collector = channel.createMessageCollector({ filter, time: 300000 }); // 5 minutos
-
-    collector.on('collect', async (message) => {
-        const email = message.content.trim();
-        
-        // Validação simples de regex de email
-        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-        if (!emailRegex.test(email)) {
-            return channel.send('⚠️ Formato de e-mail inválido. Tente novamente.');
-        }
-
-        // Pausa o coletor para confirmação
-        // collector.stop('confirmation'); 
-
-        const confirmRow = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`confirm_yes_${email}`).setLabel('Confirmar').setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId('confirm_no').setLabel('Cancelar/Corrigir').setStyle(ButtonStyle.Secondary)
-        );
-
-        const msgConfirm = await channel.send({ 
-            content: `Você digitou: **${email}**. Está correto?`, 
-            components: [confirmRow] 
-        });
-
-        // Coletor para os botões de confirmação
-        const btnCollector = msgConfirm.createMessageComponentCollector({ componentType: ComponentType.Button, time: 60000 });
-
-        btnCollector.on('collect', async (i) => {
-            if (i.user.id !== user.id) return;
-
-            if (i.customId === 'confirm_no') {
-                await i.update({ content: 'Ok, digite o e-mail novamente abaixo.', components: [] });
-                return; // O message collector principal continua rodando
-            }
-
-            if (i.customId.startsWith('confirm_yes_')) {
-                await i.update({ content: `🔄 Verificando **${email}** no sistema... Aguarde.`, components: [] });
-                collector.stop(); // Para de ouvir novas mensagens
-
-                // --- CHAMADA AO N8N ---
-                if (!N8N_WEBHOOK_VALIDATE) {
-                    return channel.send('❌ Erro: Webhook de validação não configurado no .env.');
-                }
-
-                try {
-                    const response = await axios.post(N8N_WEBHOOK_VALIDATE, {
-                        email: email,
-                        discord_id: user.id,
-                        username: user.username,
-                        ticket_channel: channel.id
-                    });
-
-                    // Espera que o N8N retorne { approved: true, message: "..." }
-                    const { approved, message } = response.data;
-
-                    if (approved) {
-                        const member = await channel.guild.members.fetch(user.id);
-                        
-                        // Adiciona o Cargo VIP
-                        if (ROLE_CLIENT_ID) await member.roles.add(ROLE_CLIENT_ID);
-                        
-                        // Remove o Cargo Comum (Se estiver configurado e o usuário tiver)
-                        if (ROLE_MEMBER_ID) {
-                            await member.roles.remove(ROLE_MEMBER_ID).catch(e => logger.warn(`Erro ao remover cargo comum: ${e.message}`));
-                        }
-                        
-                        const successEmbed = new EmbedBuilder()
-                            .setTitle('✅ Acesso Liberado!')
-                            .setDescription(message || 'Sua compra foi validada e seu cargo foi entregue.')
-                            .setColor(Colors.Green);
-                        
-                        await channel.send({ embeds: [successEmbed] });
-                        discordLog('💎 Ticket Validado', `User: ${user.tag}\nEmail: ${email}`, Colors.Green);
-                        
-                        // Opcional: Fechar ticket automaticamente após sucesso
-                        setTimeout(() => channel.send('Este ticket será fechado em 10 segundos...'), 2000);
-                        setTimeout(() => channel.delete().catch(()=>{}), 12000);
-
-                    } else {
-                        await channel.send({ 
-                            embeds: [new EmbedBuilder().setTitle('❌ Negado').setDescription(message || 'E-mail não encontrado ou compra reembolsada.').setColor(Colors.Red)] 
-                        });
-                        discordLog('🚫 Validação Falhou', `User: ${user.tag}\nEmail: ${email}\nMotivo: ${message}`, Colors.Red);
-                    }
-
-                } catch (err) {
-                    logger.error(`Erro ao chamar N8N: ${err.message}`);
-                    channel.send('❌ Erro de comunicação com o servidor. Tente mais tarde.');
-                }
-            }
-        });
-    });
-}
 
 // Anti-Crash Global
 process.on('unhandledRejection', (reason, p) => {
